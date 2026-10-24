@@ -1,0 +1,192 @@
+import { Hono } from 'hono';
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import sharp from 'sharp';
+import path from 'node:path';
+import { checkText } from './moderation.js';
+const dataPath = process.env.COMMUNITY_DATA || path.resolve(process.cwd(), '.data/community.json');
+const SESSION_COOKIE = 'wz_session';
+const sessions = new Map();
+function load() {
+    try {
+        if (existsSync(dataPath)) {
+            const d = JSON.parse(readFileSync(dataPath, 'utf8'));
+            d.users ||= [];
+            d.posts ||= [];
+            d.photos ||= [];
+            return d;
+        }
+    }
+    catch { }
+    return { users: [], posts: [], photos: [] };
+}
+let store = load();
+function save() {
+    mkdirSync(path.dirname(dataPath), { recursive: true });
+    writeFileSync(dataPath, JSON.stringify(store, null, 2), 'utf8');
+}
+function hashPassword(password, salt = randomBytes(16).toString('hex')) {
+    return { salt, hash: scryptSync(password, salt, 64).toString('hex') };
+}
+function verify(user, password) {
+    const got = Buffer.from(hashPassword(password, user.salt).hash, 'hex');
+    const want = Buffer.from(user.hash, 'hex');
+    return got.length === want.length && timingSafeEqual(got, want);
+}
+function currentUser(c) {
+    const token = getCookie(c, SESSION_COOKIE);
+    if (!token)
+        return null;
+    const s = sessions.get(token);
+    if (!s || s.exp < Date.now()) {
+        sessions.delete(token);
+        return null;
+    }
+    const user = store.users.find((u) => u.id === s.userId);
+    return user || null;
+}
+function publicUser(u) {
+    return u ? { id: u.id, email: u.email, name: u.name } : null;
+}
+function setSession(c, userId) {
+    const token = randomBytes(32).toString('hex');
+    sessions.set(token, { userId, exp: Date.now() + 7 * 24 * 3600 * 1000 });
+    setCookie(c, SESSION_COOKIE, token, { httpOnly: true, sameSite: 'Lax', path: '/', maxAge: 7 * 24 * 3600, secure: process.env.NODE_ENV === 'production' });
+}
+function clearSession(c) {
+    const token = getCookie(c, SESSION_COOKIE);
+    if (token)
+        sessions.delete(token);
+    deleteCookie(c, SESSION_COOKIE, { path: '/' });
+}
+export const community = new Hono();
+community.get('/health', (c) => c.json({ ok: true, service: 'wzsj-community' }));
+community.get('/config', (c) => c.json({ ready: true, provider: 'email' }));
+community.get('/me', (c) => c.json({ user: publicUser(currentUser(c)) }));
+community.post('/auth/register', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const email = String(body?.email || '').trim().toLowerCase();
+    const password = String(body?.password || '');
+    const name = String(body?.name || '').trim().slice(0, 24) || email.split('@')[0];
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+        return c.json({ error: '邮箱格式不正确' }, 400);
+    if (password.length < 8)
+        return c.json({ error: '密码至少 8 位' }, 400);
+    if (store.users.some((u) => u.email === email))
+        return c.json({ error: '邮箱已注册' }, 409);
+    const { salt, hash } = hashPassword(password);
+    const user = { id: randomBytes(12).toString('hex'), email, name, salt, hash, createdAt: Date.now() };
+    store.users.push(user);
+    save();
+    setSession(c, user.id);
+    return c.json({ user: publicUser(user) });
+});
+community.post('/auth/login', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const email = String(body?.email || '').trim().toLowerCase();
+    const password = String(body?.password || '');
+    const user = store.users.find((u) => u.email === email);
+    if (!user || !verify(user, password))
+        return c.json({ error: '邮箱或密码不正确' }, 401);
+    setSession(c, user.id);
+    return c.json({ user: publicUser(user) });
+});
+community.post('/auth/logout', (c) => { clearSession(c); return c.json({ ok: true }); });
+const UPLOAD_DIR = path.resolve(process.cwd(), '.data/uploads');
+const UPLOAD_PREFIX = '/api/uploads/';
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+community.post('/upload', async (c) => {
+    const user = currentUser(c);
+    if (!user)
+        return c.json({ error: '请先登录' }, 401);
+    const form = await c.req.parseBody().catch(() => null);
+    const file = form?.file;
+    if (!file || typeof file === 'string')
+        return c.json({ error: '请选择图片' }, 400);
+    if (file.size > MAX_IMAGE_BYTES)
+        return c.json({ error: '图片不能超过 5MB' }, 413);
+    const type = String(file.type || '');
+    if (type && type !== 'application/octet-stream' && !['image/jpeg', 'image/png', 'image/webp'].includes(type))
+        return c.json({ error: '只支持 JPG / PNG / WebP' }, 415);
+    const input = Buffer.from(await file.arrayBuffer());
+    try {
+        const probe = sharp(input, { failOn: 'error' });
+        const meta = await probe.metadata();
+        if (!meta.width || !meta.height || meta.width < 16 || meta.height < 16)
+            return c.json({ error: '图片尺寸过小' }, 422);
+        if (meta.width * meta.height > 40_000_000)
+            return c.json({ error: '图片尺寸过大' }, 422);
+        const output = await sharp(input).rotate().resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).webp({ quality: 82 }).toBuffer();
+        mkdirSync(UPLOAD_DIR, { recursive: true });
+        const name = randomBytes(16).toString('hex') + '.webp';
+        writeFileSync(path.join(UPLOAD_DIR, name), output);
+        return c.json({ url: UPLOAD_PREFIX + name, width: meta.width, height: meta.height });
+    }
+    catch {
+        return c.json({ error: '图片解析失败' }, 422);
+    }
+});
+community.get('/uploads/:name', (c) => {
+    const name = c.req.param('name');
+    if (!/^[a-f0-9]{32}\.webp$/.test(name))
+        return c.json({ error: 'not found' }, 404);
+    const file = path.join(UPLOAD_DIR, name);
+    if (!existsSync(file))
+        return c.json({ error: 'not found' }, 404);
+    c.header('Content-Type', 'image/webp');
+    c.header('Cache-Control', 'public, max-age=31536000, immutable');
+    return c.body(readFileSync(file));
+});
+community.post('/moderate', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const text = String(body?.text || '').slice(0, 2000);
+    const result = checkText(text);
+    return c.json({ ok: result.ok, hits: result.hits });
+});
+community.get('/posts', (c) => c.json({ posts: store.posts.slice(-100) }));
+community.post('/posts', async (c) => {
+    const user = currentUser(c);
+    if (!user)
+        return c.json({ error: '请先登录' }, 401);
+    const body = await c.req.json().catch(() => null);
+    const text = String(body?.text || '').trim().slice(0, 500);
+    const image = String(body?.image || '');
+    if (!text && !image)
+        return c.json({ error: '内容不能为空' }, 400);
+    if (image && !image.startsWith(UPLOAD_PREFIX))
+        return c.json({ error: '图片地址无效' }, 400);
+    const audit = checkText(text);
+    if (!audit.ok)
+        return c.json({ error: '内容包含不当词汇，请修改后重试', hits: audit.hits }, 422);
+    const last = store.posts.filter((p) => p.userId === user.id).slice(-1)[0];
+    if (last && Date.now() - last.ts < 1500)
+        return c.json({ error: '发送太快，稍后再试' }, 429);
+    const post = { id: randomBytes(8).toString('hex'), userId: user.id, user: user.name, text, image: image || undefined, ts: Date.now() };
+    store.posts.push(post);
+    if (store.posts.length > 2000)
+        store.posts = store.posts.slice(-2000);
+    save();
+    return c.json({ post });
+});
+community.get('/photos', (c) => c.json({ photos: store.photos.slice(-100) }));
+community.post('/photos', async (c) => {
+    const user = currentUser(c);
+    if (!user)
+        return c.json({ error: '请先登录' }, 401);
+    const body = await c.req.json().catch(() => null);
+    const image = String(body?.image || '');
+    const caption = String(body?.caption || '').trim().slice(0, 120);
+    if (!image.startsWith(UPLOAD_PREFIX))
+        return c.json({ error: '请先上传图片' }, 400);
+    const audit = checkText(caption);
+    if (!audit.ok)
+        return c.json({ error: '图片说明包含不当词汇', hits: audit.hits }, 422);
+    const photo = { id: randomBytes(8).toString('hex'), userId: user.id, user: user.name, image, caption, ts: Date.now() };
+    store.photos.push(photo);
+    if (store.photos.length > 500)
+        store.photos = store.photos.slice(-500);
+    save();
+    return c.json({ photo });
+});
+community.get('/explored', (c) => c.json({ explored: [] }));

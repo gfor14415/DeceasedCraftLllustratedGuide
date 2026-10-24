@@ -1,0 +1,17 @@
+亡者世界图鉴 0.1.0-beta 社区版完整运行包
+
+环境：Node.js 22+
+安装：npm install
+启动：node server/index.js
+访问：http://localhost:8787/guide/
+
+包含：
+- 图鉴全部内容
+- 社区 Tab
+- 邮箱注册 / 登录
+- 聊天（文字 + 图片）
+- 照片墙
+- 文字与图片上传审核
+
+数据保存在 .data/，上传图片在 .data/uploads/。
+正式部署请配置 HTTPS、反向代理，并将存储换为 SQLite/Postgres。
